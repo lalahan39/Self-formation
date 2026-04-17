@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from equinox import tree_at
 from pymdp.agent import Agent
+from pymdp.maths import calc_vfe
 
 key = jr.PRNGKey(0)
 
@@ -39,6 +40,7 @@ def stack_beliefs_over_time(qs_list: list[list[jnp.ndarray]]) -> list[jnp.ndarra
 
 
 # print 용
+
 def compute_EFE_components(
     agent: Agent,
     qs: list[jnp.ndarray],
@@ -453,7 +455,7 @@ class HierarchicalController:
         obs_higher_t1: list[jnp.ndarray],
         cfg: SimConfig
     ) -> None:
-        # t0, t1 belief/obs를 time축으로 스택 → (batch=1, T=2, ...)
+        # t0, t1 belief/obs 모두 반영 → (batch=1, T=2, ...)
         higher_qs_seq = stack_beliefs_over_time([qs_higher_t0, qs_higher_t1])
         obs_higher_seq = [
             jnp.concatenate([obs_higher_t0[0][:, None, :], obs_higher_t1[0][:, None, :]], axis=1),  # (1, T=2, No=2)
@@ -509,6 +511,8 @@ def run_simulation(cfg: SimConfig, seed: int = 7) -> dict[str, Any]:
         'q_pi_list' : [],
         'extrinsic': [],
         'epistemic': [],
+        'vfe_t0': [],
+        'vfe_t1': [],
         'G_pi': [],
         'd1_social': [],
         'd1_heart': [],
@@ -550,11 +554,20 @@ def run_simulation(cfg: SimConfig, seed: int = 7) -> dict[str, Any]:
         controller.apply_topdown_C(C1_topdown)
         
         # D1 변경 이후 lower re-inference
+        prior_t0 = [d[0] for d in controller.lower.D]
         qs_lower_t0_td = controller.lower.infer_states(
             [jnp.array([o_social0], dtype=jnp.int32), jnp.array([o_heart0], dtype=jnp.int32)],
             empirical_prior=controller.lower.D,
         )
-        
+        _, vfe_t0 = calc_vfe(
+            [q[0, -1] for q in qs_lower_t0_td], prior_t0,
+            obs=[o_social0, o_heart0],
+            A=[a[0] for a in controller.lower.A],
+            A_dependencies=controller.lower.A_dependencies,
+            distr_obs=False,
+        )
+        vfe_t0 = float(vfe_t0)
+
         # lower policy inference & action selection
         q_pi, G_pi = controller.lower.infer_policies(qs_lower_t0_td)
         action = controller.lower.sample_action(q_pi, rng_key=k_act[None, ...])
@@ -569,6 +582,15 @@ def run_simulation(cfg: SimConfig, seed: int = 7) -> dict[str, Any]:
             [jnp.array([o_social1], dtype=jnp.int32), jnp.array([o_heart1], dtype=jnp.int32)],
             empirical_prior=empirical_prior_t1,
         )
+        prior_t1 = [p[0] if p.ndim == 2 else p[0, -1] for p in empirical_prior_t1]
+        _, vfe_t1 = calc_vfe(
+            [q[0, -1] for q in qs_lower_t1], prior_t1,
+            obs=[o_social1, o_heart1],
+            A=[a[0] for a in controller.lower.A],
+            A_dependencies=controller.lower.A_dependencies,
+            distr_obs=False,
+        )
+        vfe_t1 = float(vfe_t1)
     
         # q(s1_t1) -> o2 -> q(s2_t1) inference (시간 연속성: B2 · q(s2_t0))
         higher_obs_t1 = controller.lower_to_higher_obs(qs_lower_t1)
@@ -625,6 +647,8 @@ def run_simulation(cfg: SimConfig, seed: int = 7) -> dict[str, Any]:
         logs['action'].append(int(a_t))
         logs['extrinsic'].append(extrinsic)
         logs['epistemic'].append(epistemic)
+        logs['vfe_t0'].append(vfe_t0)
+        logs['vfe_t1'].append(vfe_t1)
         logs['G_pi'].append(G_pi.copy())
         logs['d1_social'].append(d1_social)
         logs['d1_heart'].append(d1_heart)
@@ -657,11 +681,13 @@ def make_linkC(p_social: float, p_heart: float):
 
 def print_result_table(logs, label: str):
     ACT = ['silent', 'answer']
-    HDR = (f"{'trial':>5} | {'action':^7} | {'extrinsic':>10} | {'epistemic':>10} | "
-           f"{'q_pi[sil,ans]':^22} | "
-           f"{'G[sil,ans]':^22} | "
-           f"{'D1_soc[un,at]':^20} | {'D1_hrt[lo,hi]':^20} | "
-           f"{'Ao_soc[un,at]':^20} | {'Ao_hrt[lo,hi]':^20}")
+    # HDR = (f"{'trial':>5} | {'action':^7} | {'extrinsic':>10} | {'epistemic':>10} | "
+    #        f"{'q_pi[sil,ans]':^22} | "
+    #        f"{'G[sil,ans]':^22} | "
+    #        f"{'D1_soc[un,at]':^20} | {'D1_hrt[lo,hi]':^20} | "
+    #        f"{'Ao_soc[un,at]':^20} | {'Ao_hrt[lo,hi]':^20}")
+    HDR = (f"{'trial':>5} | {'action':^7} | {'q_pi[sil,ans]':^22} | {'G[sil,ans]':^22} | "
+           f"{'H(q(pi))':>10} | {'VFE(t0)':>9} | {'VFE(t1)':>9}")
     SEP = "=" * 20
     print(f"\n{SEP}")
     print(f"  Condition: {label}")
@@ -672,7 +698,7 @@ def print_result_table(logs, label: str):
         q     = logs['q_pi_list'][i]
         q_s   = f"[{float(q[0,0]):5.3f}, {float(q[0,1]):5.3f}]"
         G     = logs['G_pi'][i]
-        G_s   = f"[{float(G[0,0]):+7.4f}, {float(G[0,1]):+7.4f}]"
+        G_s   = f"[{float(G[0,0]):+6.3f}, {float(G[0,1]):+6.3f}]"
         d1s   = logs['d1_social'][i]
         d1h   = logs['d1_heart'][i]
         ls    = logs['lik_social'][i]
@@ -681,12 +707,15 @@ def print_result_table(logs, label: str):
         d1h_s = f"[{float(d1h[0]):5.3f}, {float(d1h[1]):5.3f}]"
         ls_s  = f"[{float(ls[0]):5.3f}, {float(ls[1]):5.3f}]"
         lh_s  = f"[{float(lh[0]):5.3f}, {float(lh[1]):5.3f}]"
-        print(f"{i:>5} | {ACT[logs['action'][i]]:^7} | "
-              f"{logs['extrinsic'][i]:>+10.4f} | {logs['epistemic'][i]:>+10.4f} | "
-              f"{q_s:^22} | "
-              f"{G_s:^22} | "
-              f"{d1s_s:^20} | {d1h_s:^20} | "
-              f"{ls_s:^20} | {lh_s:^20}")
+        H_ppi  = entropy(q[0])
+        # print(f"{i:>5} | {ACT[logs['action'][i]]:^7} | "
+        #       f"{logs['extrinsic'][i]:>+10.4f} | {logs['epistemic'][i]:>+10.4f} | "
+        #       f"{q_s:^22} | "
+        #       f"{G_s:^22} | "
+        #       f"{d1s_s:^20} | {d1h_s:^20} | "
+        #       f"{ls_s:^20} | {lh_s:^20}")
+        print(f"{i+1:>5} | {ACT[logs['action'][i]]:^7} | {q_s:^22} | {G_s:^22} | "
+              f"{H_ppi:>10.3f} | {logs['vfe_t0'][i]:>+9.4f} | {logs['vfe_t1'][i]:>+9.4f}")
     print(SEP)
 
 
@@ -704,16 +733,17 @@ if __name__ == '__main__':
 
     # linkC sweep
     sweep_conditions = [
-       ("0.20, 0.82",               0.20, 0.82),
-       ("0.30, 0.82",               0.30, 0.82),
+       ("0.05, 0.82",               0.05, 0.82),
+       ("0.10, 0.82",               0.10, 0.82),
+       ("0.25, 0.82",               0.25, 0.82),
        ("0.40, 0.82",               0.40, 0.82),
-       ("0.45, 0.82",               0.45, 0.82),
        ("0.50, 0.82",               0.50, 0.82),
-       ("0.55, 0.82",               0.55, 0.82),
        ("0.60, 0.82",               0.60, 0.82),
-       ("0.70, 0.82",               0.70, 0.82),
-       ("0.80, 0.82",               0.80, 0.82),
+       ("0.75, 0.82",               0.75, 0.82),
+       ("0.90, 0.82",               0.90, 0.82),
+       ("0.95, 0.82",               0.95, 0.82),
     ]
+
 
 
     # 시뮬레이션 결과 저장

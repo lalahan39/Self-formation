@@ -375,16 +375,14 @@ class HierarchicalController:
     # q(s2) -> A2, D2
     def update_higher_with_current_obs(
         self,
-        qs_higher_t0: list[jnp.ndarray],
-        obs_higher_t0: list[jnp.ndarray],
         qs_higher_t1: list[jnp.ndarray],
         obs_higher_t1: list[jnp.ndarray],
         cfg: SimConfig
     ) -> None:
-        # t0, t1 belief/obs를 time축으로 스택 → (batch=1, T=2, ...)
-        higher_qs_seq = stack_beliefs_over_time([qs_higher_t0, qs_higher_t1])
+        # t1 belief/obs만 반영 → (batch=1, T=1, ...)
+        higher_qs_seq = stack_beliefs_over_time([qs_higher_t1])
         obs_higher_seq = [
-            jnp.concatenate([obs_higher_t0[0][:, None, :], obs_higher_t1[0][:, None, :]], axis=1),  # (1, T=2, No=2)
+            obs_higher_t1[0][:, None, :],  # (1, T=1, No=2)
         ]
 
         self.higher = self.higher.infer_parameters(
@@ -508,8 +506,8 @@ def run_simulation(cfg: SimConfig, seed: int = 7) -> dict[str, Any]:
             empirical_prior=empirical_prior_higher_t1,
             return_info=True,
         )
-        # A2, D2 learning (t0, t1 둘 다 반영)
-        controller.update_higher_with_current_obs(qs_higher_t0, higher_obs_t0, qs_higher_t1, higher_obs_t1, cfg)
+        # A2, D2 learning (t1만 반영)
+        controller.update_higher_with_current_obs(qs_higher_t1, higher_obs_t1, cfg)
 
         # A1, B1 learning (t0, t1 둘 다 반영)
         lower_qs_seq = stack_beliefs_over_time([qs_lower_t0, qs_lower_t1])
@@ -609,21 +607,23 @@ def make_condition(a_heart: float, d_heart: float):
 
 
 def print_qpi_table(logs, label: str):
-    SEP = "=" * 70
+    ACT = ['silent', 'answer']
+    HDR = (f"{'trial':>5} | {'action':^7} | {'q_pi[sil,ans]':^22} | {'G[sil,ans]':^22} | "
+           f"{'H(q(pi))':>10} | {'VFE(t0)':>9} | {'VFE(t1)':>9}")
+    SEP = "=" * 20
     print(f"\n{SEP}")
     print(f"  Condition: {label}")
     print(SEP)
-    print(f"{'trial':>5} | {'q_pi[sil,ans]':^22} | {'H_pi':>6} | {'G[sil,ans]':^22}")
-    print("-" * 70)
+    print(HDR)
+    print("-" * 20)
     for i in range(len(logs['trial'])):
         q   = logs['q_pi_list'][i]
         q_s = f"[{float(q[0,0]):5.3f}, {float(q[0,1]):5.3f}]"
         G   = logs['G_pi'][i]
-        G_s = f"[{float(G[0,0]):+7.4f}, {float(G[0,1]):+7.4f}]"
-        print(f"{i:>5} | {q_s:^22} | {logs['q_pi_entropy_list'][i]:>6.3f} | {G_s:^22}")
-    mean_Hpi = float(jnp.mean(jnp.array(logs['q_pi_entropy_list'])))
-    print("-" * 70)
-    print(f"{'mean H_pi':>5}   {'':^22}   {mean_Hpi:>6.3f}")
+        G_s = f"[{float(G[0,0]):+6.3f}, {float(G[0,1]):+6.3f}]"
+        H_ppi = entropy(q[0])
+        print(f"{i+1:>5} | {ACT[logs['action'][i]]:^7} | {q_s:^22} | {G_s:^22} | "
+              f"{H_ppi:>10.3f} | {logs['vfe_t0_list'][i]:>+9.4f} | {logs['vfe_t1_list'][i]:>+9.4f}")
     print(SEP)
 
 
