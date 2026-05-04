@@ -14,4 +14,3 @@ This code is based in part on the open-source `pymdp` framework, with small task
 
 ## Files
 - `Hierarchical.py` : hierarchical model with higher-level self inference
-- `Non-hierarchical.py` : baseline model without top-down control of a higher agent
